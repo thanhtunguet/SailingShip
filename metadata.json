@@ -1,0 +1,6 @@
+{
+  "name": "Pelagic — First-Person Ocean Ship Simulator",
+  "description": "Cinematic real-time 3D ocean navigation experience from a ship's helm with dynamic Gerstner waves, autonomous weather systems, and realistic vessel physics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
