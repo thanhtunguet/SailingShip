@@ -9,6 +9,7 @@ import { ShipPhysics } from './ShipPhysics';
 import { SkyAndAtmosphere } from './SkyAndAtmosphere';
 import { WaveField } from './WaveField';
 import { WeatherSystem } from './WeatherSystem';
+import { SimulationTelemetry, WeatherControlMode, WiperMode } from './types';
 
 function detectSoftwareWebGL(): boolean {
   try {
@@ -28,7 +29,7 @@ function detectSoftwareWebGL(): boolean {
 /**
  * Top-level real-time ocean simulation orchestrator.
  * Owns WebGL2 renderer, scene graph, delta-time loop, software-WebGL pacing,
- * resize handling, and clean resource teardown.
+ * interactive weather/wind/cloud/storm controls, and clean resource teardown.
  */
 export class SimulationManager {
   private readonly container: HTMLElement;
@@ -81,7 +82,6 @@ export class SimulationManager {
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(58, width / Math.max(height, 1), 0.15, 7000);
 
-    // Studio/sky environment reflection map for brass, stainless steel, and glass
     const pmremGenerator = new THREE.PMREMGenerator(this.renderer);
     const roomEnv = new RoomEnvironment();
     this.envTexture = pmremGenerator.fromScene(roomEnv, 0.04).texture;
@@ -90,7 +90,6 @@ export class SimulationManager {
     roomEnv.dispose();
     pmremGenerator.dispose();
 
-    // Instantiate modular simulation systems
     this.weatherSystem = new WeatherSystem();
     this.waveField = new WaveField();
     this.lightningSystem = new LightningSystem(this.scene);
@@ -103,19 +102,16 @@ export class SimulationManager {
     this.shipController = new ShipController();
     this.particleEffects = new ParticleEffects(this.scene);
 
-    // Initial synchronous tick so frame 0 has accurate ship/wave/camera alignment
     this.stepSimulation(0.016);
 
     if (!this.isSoftwareGl) {
       this.renderer.compile(this.scene, this.camera);
     }
 
-    // Resize handling
     this.resizeObserver = new ResizeObserver(() => this.handleResize());
     this.resizeObserver.observe(this.container);
     window.addEventListener('resize', this.handleResize);
 
-    // WebGL context recovery
     this.onContextLostBound = (e: Event) => {
       e.preventDefault();
       this.stopLoop();
@@ -131,6 +127,67 @@ export class SimulationManager {
 
     this.clock.start();
     this.startLoop();
+  }
+
+  public setWeatherMode(mode: WeatherControlMode): void {
+    this.weatherSystem.setMode(mode);
+  }
+
+  public setWindSpeed(speed: number | null): void {
+    this.weatherSystem.setWindSpeedOverride(speed);
+  }
+
+  public setWindAngleDeg(deg: number | null): void {
+    this.weatherSystem.setWindAngleOverride(
+      deg === null ? null : THREE.MathUtils.degToRad(deg),
+    );
+  }
+
+  public setCloudCoverage(coverage: number | null): void {
+    this.weatherSystem.setCloudCoverageOverride(coverage);
+  }
+
+  public setCloudDarkness(darkness: number | null): void {
+    this.weatherSystem.setCloudDarknessOverride(darkness);
+  }
+
+  public spawnStormAhead(): void {
+    const s = this.shipPhysics.state;
+    this.weatherSystem.spawnStormAhead(s.x, s.z, s.yaw);
+    this.lightningSystem.triggerImmediateCellStrike(this.weatherSystem.stormCell);
+  }
+
+  public clearWeatherOverrides(): void {
+    this.weatherSystem.clearOverrides();
+  }
+
+  public setWiperMode(mode: WiperMode): void {
+    this.shipController.wiperMode = mode;
+  }
+
+  public setWiperSpeed(speed: number): void {
+    this.shipController.wiperSpeed = THREE.MathUtils.clamp(speed, 0.4, 2.5);
+  }
+
+  public getTelemetry(): SimulationTelemetry {
+    const active = this.weatherSystem.active;
+    const ov = this.weatherSystem.overrides;
+    const effectiveWindAngle = ov.windAngle !== null ? ov.windAngle : active.windAngle;
+    const deg = ((THREE.MathUtils.radToDeg(effectiveWindAngle) % 360) + 360) % 360;
+    return {
+      mode: ov.mode,
+      currentState: this.weatherSystem.targetState,
+      windSpeed: ov.windSpeed !== null ? ov.windSpeed : active.windSpeed,
+      windAngleDeg: deg,
+      cloudCoverage: ov.cloudCoverage !== null ? ov.cloudCoverage : active.cloudCoverage,
+      cloudDarkness: ov.cloudDarkness !== null ? ov.cloudDarkness : active.cloudDarkness,
+      stormActive: this.weatherSystem.stormCell.active,
+      stormDistance: Math.round(this.weatherSystem.stormCell.distance),
+      hasOverrides: this.weatherSystem.hasManualOverrides(),
+      wiperMode: this.shipController.wiperMode,
+      wiperSpeed: this.shipController.wiperSpeed,
+      wiperActive: this.shipController.isWiperActive,
+    };
   }
 
   private handleResize = (): void => {
@@ -161,7 +218,6 @@ export class SimulationManager {
     if (this.disposed) return;
 
     const rawDelta = this.clock.getDelta();
-    // Clamp delta so tab switching never causes a physics explosion
     const dt = Math.min(Math.max(rawDelta, 0.001), 0.05);
 
     this.stepSimulation(dt);
@@ -177,17 +233,12 @@ export class SimulationManager {
   private stepSimulation(dt: number): void {
     this.elapsedSimTime += dt;
 
-    // 1. Update autonomous weather state machine
-    const weather = this.weatherSystem.update(dt, this.elapsedSimTime);
+    const ship = this.shipPhysics.state;
+    const weather = this.weatherSystem.update(dt, this.elapsedSimTime, ship.x, ship.z);
 
-    // 2. Snap ocean grid to 2.0m increments near ship & compute double-precision Gerstner phases
-    const [originX, originZ] = this.oceanRenderer.getSnappedOrigin(
-      this.shipPhysics.state.x,
-      this.shipPhysics.state.z,
-    );
+    const [originX, originZ] = this.oceanRenderer.getSnappedOrigin(ship.x, ship.z);
     this.waveField.update(dt, this.elapsedSimTime, weather, originX, originZ);
 
-    // 3. Step ship hydrodynamics & 5-point Gerstner buoyancy
     const shipState = this.shipPhysics.update(
       dt,
       this.elapsedSimTime,
@@ -196,27 +247,26 @@ export class SimulationManager {
       weather,
     );
 
-    // 4. Update lightning flashes & bolts
     const lightning = this.lightningSystem.update(
       dt,
       weather,
+      this.weatherSystem.stormCell,
       shipState.x,
       shipState.z,
       shipState.yaw,
     );
 
-    // 5. Update sky dome, clouds, sun & fog
     this.skyAndAtmosphere.update(
       dt,
       this.elapsedSimTime,
       weather,
       lightning,
+      this.weatherSystem.stormCell,
       shipState.x,
       shipState.z,
       this.renderer,
     );
 
-    // 6. Update ocean uniforms & ship wake
     this.oceanRenderer.update(
       this.elapsedSimTime,
       originX,
@@ -226,12 +276,20 @@ export class SimulationManager {
       this.skyAndAtmosphere.sunDirection,
       this.skyAndAtmosphere.fog.color,
       lightning,
+      this.weatherSystem.stormCell.bearingDir,
+      this.weatherSystem.stormCell.angularRadius,
+      this.weatherSystem.stormCell.active ? this.weatherSystem.stormCell.intensity : 0,
     );
 
-    // 7. Update ship visual model, helm hardware, & damped first-person camera
-    this.shipController.update(dt, shipState, this.shipModel, this.camera, weather);
-
-    // 8. Update wind-driven rain & bow/sea spray particles
+    this.shipController.update(
+      dt,
+      this.elapsedSimTime,
+      shipState,
+      this.shipModel,
+      this.camera,
+      weather,
+      lightning,
+    );
     this.particleEffects.update(dt, this.camera, shipState, weather, lightning);
   }
 

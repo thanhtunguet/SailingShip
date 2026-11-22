@@ -1,5 +1,11 @@
 import * as THREE from 'three';
-import { WeatherParams, WeatherState } from './types';
+import {
+  StormCellState,
+  WeatherControlMode,
+  WeatherOverrides,
+  WeatherParams,
+  WeatherState,
+} from './types';
 
 function cloneParams(p: WeatherParams): WeatherParams {
   return {
@@ -180,15 +186,36 @@ const TRANSITION_TABLE: Record<WeatherState, Array<{ state: WeatherState; weight
 };
 
 /**
- * Autonomous long-duration weather state machine with weighted non-repeating
- * transitions, 20-55s smooth morphing, and continuous gust/wind evolution.
+ * Autonomous long-duration weather state machine with weighted transitions,
+ * interactive overrides (weather preset, wind, clouds), and localized Storm Ahead cells.
  */
 export class WeatherSystem {
   public currentState: WeatherState = 'CALM_OCEAN';
   public targetState: WeatherState = 'CALM_OCEAN';
 
+  public readonly overrides: WeatherOverrides = {
+    mode: 'AUTO',
+    windSpeed: null,
+    windAngle: null,
+    cloudCoverage: null,
+    cloudDarkness: null,
+  };
+
+  public readonly stormCell: StormCellState = {
+    active: false,
+    x: 0,
+    z: 0,
+    radius: 560,
+    intensity: 0,
+    proximity: 0,
+    angularRadius: 0.5,
+    bearingDir: new THREE.Vector3(0, 0, -1),
+    distance: 1000,
+  };
+
   private fromParams: WeatherParams;
   private toParams: WeatherParams;
+  private readonly baseActive: WeatherParams;
   public readonly active: WeatherParams;
 
   private phaseTimer = 0;
@@ -200,21 +227,101 @@ export class WeatherSystem {
   private targetWindAngleOffset = 0;
   private fromWindAngleOffset = 0;
   private gustTime = 0;
+  private stormLifeAge = 0;
+  private stormMaxLife = 240;
+  private stormDriftVx = 0;
+  private stormDriftVz = 0;
+
+  // Smoothly damped manual overrides
+  private smoothedWindSpeed = 5.5;
+  private smoothedWindAngle = 0.45;
+  private smoothedCloudCov = 0.32;
+  private smoothedCloudDark = 0.08;
 
   constructor() {
     this.fromParams = cloneParams(WEATHER_PROFILES.CALM_OCEAN);
     this.toParams = cloneParams(WEATHER_PROFILES.CALM_OCEAN);
+    this.baseActive = cloneParams(WEATHER_PROFILES.CALM_OCEAN);
     this.active = cloneParams(WEATHER_PROFILES.CALM_OCEAN);
     this.phaseDuration = this.randomRange(105, 165);
   }
 
-  public update(dt: number, elapsedTime: number): WeatherParams {
+  public setMode(mode: WeatherControlMode): void {
+    this.overrides.mode = mode;
+    if (mode !== 'AUTO' && (mode !== this.targetState || !this.isTransitioning && mode !== this.currentState)) {
+      this.startTransitionTo(mode, 10.0);
+    }
+  }
+
+  public setWindSpeedOverride(speed: number | null): void {
+    this.overrides.windSpeed = speed;
+  }
+
+  public setWindAngleOverride(angleRad: number | null): void {
+    this.overrides.windAngle = angleRad;
+  }
+
+  public setCloudCoverageOverride(coverage: number | null): void {
+    this.overrides.cloudCoverage = coverage;
+  }
+
+  public setCloudDarknessOverride(darkness: number | null): void {
+    this.overrides.cloudDarkness = darkness;
+  }
+
+  public clearOverrides(): void {
+    this.overrides.mode = 'AUTO';
+    this.overrides.windSpeed = null;
+    this.overrides.windAngle = null;
+    this.overrides.cloudCoverage = null;
+    this.overrides.cloudDarkness = null;
+  }
+
+  public hasManualOverrides(): boolean {
+    return (
+      this.overrides.mode !== 'AUTO' ||
+      this.overrides.windSpeed !== null ||
+      this.overrides.windAngle !== null ||
+      this.overrides.cloudCoverage !== null ||
+      this.overrides.cloudDarkness !== null
+    );
+  }
+
+  /**
+   * Spawns a localized thunderstorm squall cell ~780m ahead of the ship's bow.
+   * Visible immediately on the forward horizon with dark clouds, rain shaft,
+   * and lightning; intensifies waves/rain/wind as the ship sails into it.
+   */
+  public spawnStormAhead(shipX: number, shipZ: number, shipYaw: number): void {
+    const fwdX = -Math.sin(shipYaw);
+    const fwdZ = -Math.cos(shipYaw);
+    const spawnDist = 780;
+
+    this.stormCell.active = true;
+    this.stormCell.x = shipX + fwdX * spawnDist;
+    this.stormCell.z = shipZ + fwdZ * spawnDist;
+    this.stormCell.radius = 520;
+    this.stormCell.intensity = 0.08;
+    this.stormCell.proximity = 0;
+    this.stormLifeAge = 0;
+    this.stormMaxLife = 260;
+
+    // Slow approach + cross drift so the squall feels alive on the ocean
+    this.stormDriftVx = -fwdX * 2.2 + Math.cos(this.active.windAngle) * 1.6;
+    this.stormDriftVz = -fwdZ * 2.2 + Math.sin(this.active.windAngle) * 1.6;
+  }
+
+  public update(dt: number, elapsedTime: number, shipX = 0, shipZ = 0): WeatherParams {
     this.gustTime += dt;
 
+    // 1. State Machine Progression
     if (!this.isTransitioning) {
-      this.phaseTimer += dt;
-      if (this.phaseTimer >= this.phaseDuration) {
-        this.beginNextTransition();
+      if (this.overrides.mode === 'AUTO') {
+        this.phaseTimer += dt;
+        if (this.phaseTimer >= this.phaseDuration) {
+          const next = this.pickWeightedNextState(this.currentState);
+          this.startTransitionTo(next, this.randomRange(24, 52));
+        }
       }
     } else {
       this.transitionTimer += dt;
@@ -223,9 +330,8 @@ export class WeatherSystem {
         0,
         1,
       );
-      // Quintic smootherstep for imperceptible start/end of weather shifts
       const t = rawT * rawT * rawT * (rawT * (rawT * 6 - 15) + 10);
-      this.interpolateParams(this.fromParams, this.toParams, t, this.active);
+      this.interpolateParams(this.fromParams, this.toParams, t, this.baseActive);
 
       if (rawT >= 1) {
         this.isTransitioning = false;
@@ -238,29 +344,31 @@ export class WeatherSystem {
       }
     }
 
-    // Continuous autonomous wind gusts and subtle atmospheric drift within steady state
+    // Copy base state into active before applying gusts, overrides, and storm cell
+    this.copyParams(this.baseActive, this.active);
+
+    // 2. Continuous Wind Gusts & Sun Drift
     const gust =
       0.11 * Math.sin(this.gustTime * 0.27) +
       0.07 * Math.sin(this.gustTime * 0.63 + 1.4) +
       0.04 * Math.cos(this.gustTime * 1.15);
 
     const baseWind = this.isTransitioning
-      ? this.active.windSpeed
+      ? this.baseActive.windSpeed
       : this.fromParams.windSpeed;
-    this.active.windSpeed = Math.max(2.0, baseWind * (1.0 + gust));
+    const autoWindSpeed = Math.max(2.0, baseWind * (1.0 + gust));
 
     const windShift =
       Math.sin(elapsedTime * 0.017) * 0.16 +
       Math.cos(elapsedTime * 0.009 + 2.1) * 0.11;
     const baseWindAngle = this.isTransitioning
-      ? this.active.windAngle
+      ? this.baseActive.windAngle
       : this.fromParams.windAngle + this.fromWindAngleOffset;
-    this.active.windAngle = baseWindAngle + windShift;
+    const autoWindAngle = baseWindAngle + windShift;
 
-    // Gentle sun drift over long viewing sessions (subtle warm golden evolution)
     const sunCycle = Math.sin(elapsedTime * 0.0055);
     const baseElev = this.isTransitioning
-      ? this.active.sunElevation
+      ? this.baseActive.sunElevation
       : this.fromParams.sunElevation;
     this.active.sunElevation = THREE.MathUtils.clamp(
       baseElev + sunCycle * 0.06,
@@ -269,26 +377,155 @@ export class WeatherSystem {
     );
 
     const baseAz = this.isTransitioning
-      ? this.active.sunAzimuth
+      ? this.baseActive.sunAzimuth
       : this.fromParams.sunAzimuth;
     this.active.sunAzimuth = baseAz + elapsedTime * 0.0018;
+
+    // 3. Smoothly Apply User Overrides (Wind & Clouds)
+    const targetWindSpd =
+      this.overrides.windSpeed !== null
+        ? Math.max(2.0, this.overrides.windSpeed * (1.0 + gust * 0.65))
+        : autoWindSpeed;
+    this.smoothedWindSpeed = THREE.MathUtils.damp(this.smoothedWindSpeed, targetWindSpd, 2.5, dt);
+    this.active.windSpeed = this.smoothedWindSpeed;
+
+    // When user raises wind speed manually, couple wave chop/foam/spray realistically
+    if (this.overrides.windSpeed !== null) {
+      const windNorm = THREE.MathUtils.clamp((this.smoothedWindSpeed - 4) / 26, 0, 1);
+      this.active.waveAmplitudeScale = THREE.MathUtils.lerp(
+        this.active.waveAmplitudeScale,
+        0.38 + windNorm * 1.68,
+        0.72,
+      );
+      this.active.waveChoppiness = THREE.MathUtils.lerp(
+        this.active.waveChoppiness,
+        0.28 + windNorm * 1.48,
+        0.78,
+      );
+      this.active.foamIntensity = THREE.MathUtils.lerp(
+        this.active.foamIntensity,
+        0.18 + windNorm * 1.42,
+        0.78,
+      );
+      this.active.sprayIntensity = THREE.MathUtils.lerp(
+        this.active.sprayIntensity,
+        Math.max(0, (windNorm - 0.25) * 1.85),
+        0.75,
+      );
+    }
+
+    const targetWindAng =
+      this.overrides.windAngle !== null ? this.overrides.windAngle : autoWindAngle;
+    this.smoothedWindAngle = this.lerpAngle(
+      this.smoothedWindAngle,
+      targetWindAng,
+      1 - Math.exp(-3.0 * dt),
+    );
+    this.active.windAngle = this.smoothedWindAngle;
+
+    const targetCloudCov =
+      this.overrides.cloudCoverage !== null
+        ? this.overrides.cloudCoverage
+        : this.baseActive.cloudCoverage;
+    this.smoothedCloudCov = THREE.MathUtils.damp(this.smoothedCloudCov, targetCloudCov, 2.8, dt);
+    this.active.cloudCoverage = this.smoothedCloudCov;
+
+    const targetCloudDark =
+      this.overrides.cloudDarkness !== null
+        ? this.overrides.cloudDarkness
+        : this.baseActive.cloudDarkness;
+    this.smoothedCloudDark = THREE.MathUtils.damp(this.smoothedCloudDark, targetCloudDark, 2.8, dt);
+    this.active.cloudDarkness = this.smoothedCloudDark;
+
+    // Adjust sun visibility subtly when user manually thickens & darkens clouds
+    if (this.overrides.cloudCoverage !== null || this.overrides.cloudDarkness !== null) {
+      const overcast = this.active.cloudCoverage * (0.35 + 0.65 * this.active.cloudDarkness);
+      this.active.sunVisibility = Math.min(
+        this.active.sunVisibility,
+        THREE.MathUtils.clamp(1.05 - overcast * 1.15, 0.03, 0.96),
+      );
+    }
+
+    // 4. Localized "Storm Ahead" Cell Update & Proximity Blending
+    if (this.stormCell.active) {
+      this.stormLifeAge += dt;
+      this.stormCell.x += this.stormDriftVx * dt;
+      this.stormCell.z += this.stormDriftVz * dt;
+
+      const dx = this.stormCell.x - shipX;
+      const dz = this.stormCell.z - shipZ;
+      const dist = Math.hypot(dx, dz);
+      this.stormCell.distance = dist;
+
+      if (dist > 0.001) {
+        this.stormCell.bearingDir.set(dx / dist, 0.08, dz / dist).normalize();
+      }
+      this.stormCell.angularRadius = THREE.MathUtils.clamp(
+        Math.atan2(this.stormCell.radius * 0.9, Math.max(dist, 120)),
+        0.26,
+        1.55,
+      );
+
+      // Build up smoothly in 6s, fade out after maxLife or sailing far past
+      const buildUp = THREE.MathUtils.clamp(this.stormLifeAge / 6.0, 0, 1);
+      const fadeOut =
+        this.stormLifeAge > this.stormMaxLife - 25
+          ? THREE.MathUtils.clamp((this.stormMaxLife - this.stormLifeAge) / 25, 0, 1)
+          : 1.0;
+      const distFade = dist > 1650 ? THREE.MathUtils.clamp(1 - (dist - 1650) / 400, 0, 1) : 1.0;
+
+      this.stormCell.intensity = buildUp * fadeOut * distFade;
+
+      // Proximity: 0 at 1050m, 1 inside 320m radius
+      const rawProx = THREE.MathUtils.clamp(
+        1.0 - (dist - 280) / (this.stormCell.radius * 1.45),
+        0,
+        1,
+      );
+      this.stormCell.proximity = THREE.MathUtils.damp(
+        this.stormCell.proximity,
+        rawProx * this.stormCell.intensity,
+        1.2,
+        dt,
+      );
+
+      if (this.stormCell.intensity <= 0.002 && this.stormLifeAge > 10) {
+        this.stormCell.active = false;
+        this.stormCell.proximity = 0;
+      }
+
+      // Blend local storm severity into weather as the ship enters the storm cell
+      const p = this.stormCell.proximity;
+      if (p > 0.01) {
+        this.interpolateParams(this.active, WEATHER_PROFILES.SEVERE_THUNDERSTORM, p * 0.9, this.active);
+      }
+      // Even from afar, nearby storm swells start rolling toward the bow
+      const swellReach = THREE.MathUtils.clamp(
+        (1.0 - dist / 1400) * this.stormCell.intensity * 0.55,
+        0,
+        0.55,
+      );
+      this.active.waveAmplitudeScale = Math.max(
+        this.active.waveAmplitudeScale,
+        THREE.MathUtils.lerp(this.active.waveAmplitudeScale, 1.85, swellReach),
+      );
+    }
 
     return this.active;
   }
 
-  private beginNextTransition(): void {
-    const next = this.pickWeightedNextState(this.currentState);
+  private startTransitionTo(next: WeatherState, duration: number): void {
     this.targetState = next;
-    this.fromParams = cloneParams(this.active);
+    this.fromParams = cloneParams(this.baseActive);
     this.toParams = cloneParams(WEATHER_PROFILES[next]);
 
-    // Give each weather episode its own organic wind bearing variation
-    this.targetWindAngleOffset = this.randomRange(-0.55, 0.55);
+    this.targetWindAngleOffset =
+      this.overrides.mode === 'AUTO' ? this.randomRange(-0.55, 0.55) : 0;
     this.toParams.windAngle += this.targetWindAngleOffset;
 
     this.isTransitioning = true;
     this.transitionTimer = 0;
-    this.transitionDuration = this.randomRange(24, 52);
+    this.transitionDuration = duration;
   }
 
   private pickWeightedNextState(current: WeatherState): WeatherState {
@@ -301,6 +538,34 @@ export class WeatherSystem {
       if (r <= 0) return o.state;
     }
     return options[0].state;
+  }
+
+  private copyParams(src: WeatherParams, dst: WeatherParams): void {
+    dst.windSpeed = src.windSpeed;
+    dst.windAngle = src.windAngle;
+    dst.waveAmplitudeScale = src.waveAmplitudeScale;
+    dst.waveSteepnessScale = src.waveSteepnessScale;
+    dst.waveChoppiness = src.waveChoppiness;
+    dst.foamIntensity = src.foamIntensity;
+    dst.sprayIntensity = src.sprayIntensity;
+    dst.rainIntensity = src.rainIntensity;
+    dst.cloudCoverage = src.cloudCoverage;
+    dst.cloudDarkness = src.cloudDarkness;
+    dst.fogDensity = src.fogDensity;
+    dst.sunVisibility = src.sunVisibility;
+    dst.sunElevation = src.sunElevation;
+    dst.sunAzimuth = src.sunAzimuth;
+    dst.lightningRate = src.lightningRate;
+    dst.exposure = src.exposure;
+
+    dst.sunColor.copy(src.sunColor);
+    dst.skyZenithColor.copy(src.skyZenithColor);
+    dst.skyHorizonColor.copy(src.skyHorizonColor);
+    dst.hemiSkyColor.copy(src.hemiSkyColor);
+    dst.hemiGroundColor.copy(src.hemiGroundColor);
+    dst.fogColor.copy(src.fogColor);
+    dst.waterDeepColor.copy(src.waterDeepColor);
+    dst.waterShallowColor.copy(src.waterShallowColor);
   }
 
   private interpolateParams(

@@ -1,10 +1,10 @@
 import * as THREE from 'three';
 import { ShipModelRefs } from './ShipModel';
-import { ControlsInput, ShipState, WeatherParams } from './types';
+import { ControlsInput, LightningState, ShipState, WeatherParams } from './types';
 
 /**
  * Handles arrow-key input (preventing browser scrolling), animates ship helm
- * hardware, and drives the smoothly damped first-person bridge camera.
+ * hardware & windshield wipers, and drives the smoothly damped first-person bridge cabin camera.
  */
 export class ShipController {
   public readonly input: ControlsInput = {
@@ -14,7 +14,11 @@ export class ShipController {
     right: false,
   };
 
-  private readonly helmOffset = new THREE.Vector3(0, 6.95, 2.6);
+  public wiperMode: 'AUTO' | 'ON' | 'OFF' = 'AUTO';
+  public wiperSpeed = 1.0; // multiplier 0.4 .. 2.5
+  public isWiperActive = false;
+
+  private readonly helmOffset = new THREE.Vector3(0, 7.05, 2.45);
   private readonly camLocalQuat = new THREE.Quaternion();
   private readonly shipWorldQuat = new THREE.Quaternion();
   private readonly eulerScratch = new THREE.Euler(0, 0, 0, 'YXZ');
@@ -24,6 +28,7 @@ export class ShipController {
   private dampedCamRoll = 0;
   private dampedImpactBob = 0;
   private helmWheelAngle = 0;
+  private wiperCycle = 0; // 0 = parked flat, 0..2PI = full sweep-and-return stroke
 
   private readonly handleKeyDownBound: (e: KeyboardEvent) => void;
   private readonly handleKeyUpBound: (e: KeyboardEvent) => void;
@@ -91,10 +96,12 @@ export class ShipController {
 
   public update(
     dt: number,
+    elapsedTime: number,
     ship: ShipState,
     model: ShipModelRefs,
     camera: THREE.PerspectiveCamera,
     weather: WeatherParams,
+    lightning: LightningState,
   ): void {
     // 1. Update Ship Root Transform
     model.root.position.set(ship.x, ship.y, ship.z);
@@ -103,11 +110,10 @@ export class ShipController {
     model.root.quaternion.copy(this.shipWorldQuat);
 
     // 2. Animate Ship Helm Wheel & Engine Telegraph Lever
-    const targetWheelRot = ship.rudderAngle * 3.8; // multiple wheel spokes turn per rudder sweep
+    const targetWheelRot = ship.rudderAngle * 3.8;
     this.helmWheelAngle = THREE.MathUtils.damp(this.helmWheelAngle, targetWheelRot, 8.0, dt);
     model.helmWheel.rotation.z = this.helmWheelAngle;
 
-    // Engine telegraph tilts forward (-X) as throttle increases
     const targetLeverAngle = THREE.MathUtils.lerp(0.62, -0.78, ship.targetThrottle);
     model.telegraphLever.rotation.x = THREE.MathUtils.damp(
       model.telegraphLever.rotation.x,
@@ -116,7 +122,7 @@ export class ShipController {
       dt,
     );
 
-    // 3. Dynamic Wet Deck Sheen & Storm Navigation Light Intensity
+    // 3. Dynamic Wet Deck Sheen, Windshield Rain & Bottom-Mounted Wipers
     const wetness = THREE.MathUtils.clamp(
       weather.rainIntensity * 0.9 + weather.sprayIntensity * 0.35 + ship.bowImpact * 0.25,
       0,
@@ -125,17 +131,61 @@ export class ShipController {
     model.deckMaterial.roughness = THREE.MathUtils.lerp(0.72, 0.24, wetness);
     model.hullMaterial.roughness = THREE.MathUtils.lerp(0.48, 0.22, wetness);
 
+    const glassWetness = THREE.MathUtils.clamp(
+      weather.rainIntensity + weather.sprayIntensity * 0.28 + ship.bowImpact * 0.18,
+      0,
+      1,
+    );
+
+    const autoShouldWipe =
+      weather.rainIntensity > 0.06 ||
+      weather.sprayIntensity > 0.45 ||
+      ship.bowImpact > 0.45;
+    const wantsWipe =
+      this.wiperMode === 'ON' || (this.wiperMode === 'AUTO' && autoShouldWipe);
+
+    const autoRateBoost =
+      this.wiperMode === 'AUTO' ? 0.85 + glassWetness * 0.65 : 1.0;
+
+    if (wantsWipe) {
+      this.wiperCycle += dt * 3.2 * this.wiperSpeed * autoRateBoost;
+      if (this.wiperCycle >= Math.PI * 2) {
+        this.wiperCycle %= Math.PI * 2;
+      }
+      this.isWiperActive = true;
+    } else if (this.wiperCycle > 0.001) {
+      // Smoothly finish the return stroke back onto the bottom sill before parking
+      this.wiperCycle += dt * 3.4 * Math.max(this.wiperSpeed, 1.0);
+      if (this.wiperCycle >= Math.PI * 2) {
+        this.wiperCycle = 0;
+        this.isWiperActive = false;
+      } else {
+        this.isWiperActive = true;
+      }
+    } else {
+      this.wiperCycle = 0;
+      this.isWiperActive = false;
+    }
+
+    const sweepAmount = 0.5 - 0.5 * Math.cos(this.wiperCycle);
+    model.wiperLeft.rotation.z = THREE.MathUtils.lerp(-1.53, -0.18, sweepAmount);
+    model.wiperRight.rotation.z = THREE.MathUtils.lerp(1.53, 0.18, sweepAmount);
+
+    const wu = model.windshieldMat.uniforms;
+    wu.uTime.value = elapsedTime;
+    wu.uRainIntensity.value = glassWetness;
+    wu.uWiperSweep.value = sweepAmount;
+    wu.uFlashIntensity.value = lightning.flashIntensity;
+    wu.uSkyTint.value.copy(weather.skyHorizonColor);
+
     const navGlow = THREE.MathUtils.lerp(0.75, 2.4, 1.0 - weather.sunVisibility);
     model.portLightMat.emissiveIntensity = navGlow;
     model.stbdLightMat.emissiveIntensity = navGlow;
     model.mastLightMat.emissiveIntensity = navGlow * 0.9;
     model.compassGlowMat.emissiveIntensity = 0.55 + (1.0 - weather.sunVisibility) * 0.9;
 
-    // 4. First-Person Helm Camera with Smooth Horizon-Stabilized Damping
-    // Camera follows ship yaw directly, and smoothly damps pitch/roll with
-    // natural human inner-ear stabilization (~62% pitch, ~52% roll coupling)
-    // so the bow rises/plunges dynamically while avoiding harsh camera jitter.
-    const targetPitch = ship.pitch * 0.62 - 0.075; // slight downward gaze toward bow & horizon
+    // 4. First-Person Bridge Cabin Camera with Smooth Horizon-Stabilized Damping
+    const targetPitch = ship.pitch * 0.62 - 0.068;
     const targetRoll = ship.roll * 0.52;
 
     this.dampedCamPitch = THREE.MathUtils.damp(this.dampedCamPitch, targetPitch, 5.5, dt);
@@ -144,7 +194,6 @@ export class ShipController {
     const impactDrop = -ship.bowImpact * 0.085;
     this.dampedImpactBob = THREE.MathUtils.damp(this.dampedImpactBob, impactDrop, 9.0, dt);
 
-    // Compute world camera position attached to ship helm deck
     this.camPosWorld
       .copy(this.helmOffset)
       .setY(this.helmOffset.y + this.dampedImpactBob)
@@ -156,7 +205,6 @@ export class ShipController {
     this.camLocalQuat.setFromEuler(this.eulerScratch);
     camera.quaternion.copy(this.camLocalQuat);
 
-    // Subtle speed-linked FOV breathing (58 deg -> 61.5 deg)
     const targetFov = 58.0 + (ship.forwardSpeed / 11.5) * 3.5;
     if (Math.abs(camera.fov - targetFov) > 0.02) {
       camera.fov = THREE.MathUtils.damp(camera.fov, targetFov, 2.5, dt);

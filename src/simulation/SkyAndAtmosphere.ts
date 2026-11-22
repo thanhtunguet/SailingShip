@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { LightningState, WeatherParams } from './types';
+import { LightningState, StormCellState, WeatherParams } from './types';
 
 const SKY_VERTEX_SHADER = /* glsl */ `
 varying vec3 vWorldDir;
@@ -28,6 +28,11 @@ uniform vec2 uWindOffset;
 uniform vec3 uLightningHotspot;
 uniform float uLightningStrength;
 uniform float uFlashIntensity;
+
+// Localized Storm Ahead cell
+uniform vec3 uStormDir;
+uniform float uStormAngularRadius;
+uniform float uStormIntensity;
 
 float hash21(vec2 p) {
   p = fract(p * vec2(123.34, 456.21));
@@ -62,17 +67,26 @@ void main() {
   vec3 dir = normalize(vWorldDir);
   float y = max(dir.y, 0.0);
 
-  // Atmospheric gradient with soft Rayleigh horizon brightening
+  // Localized storm squall mask on the forward horizon
+  vec2 dirXZ = normalize(dir.xz + vec2(1e-5));
+  vec2 stormXZ = normalize(uStormDir.xz + vec2(1e-5));
+  float stormAngle = acos(clamp(dot(dirXZ, stormXZ), -1.0, 1.0));
+  float stormSector = (1.0 - smoothstep(uStormAngularRadius * 0.35, uStormAngularRadius * 1.15, stormAngle)) * uStormIntensity;
+  float stormHeightMask = smoothstep(0.55, 0.04, dir.y);
+  float localStorm = stormSector * stormHeightMask;
+
   float horizonCurve = pow(1.0 - y, 3.2);
   vec3 skyCol = mix(uZenithColor, uHorizonColor, horizonCurve);
 
-  // Warm/cool Mie scattering glow around sun direction
+  // Darken atmospheric backdrop inside the distant storm cell
+  vec3 stormHorizonCol = vec3(0.11, 0.16, 0.21);
+  skyCol = mix(skyCol, stormHorizonCol, localStorm * 0.78);
+
   float sunDot = max(dot(dir, uSunDir), 0.0);
   float mieGlow = pow(sunDot, 6.0) * 0.35 + pow(sunDot, 48.0) * 0.55;
   float sunDisc = smoothstep(0.99935, 0.99975, sunDot);
-  skyCol += uSunColor * (mieGlow * (0.28 + 0.72 * uSunVisibility));
+  skyCol += uSunColor * (mieGlow * (0.28 + 0.72 * uSunVisibility) * (1.0 - localStorm * 0.85));
 
-  // Project sky ray onto curved atmospheric cloud ceiling for natural perspective
   if (dir.y > 0.005) {
     float projY = dir.y + 0.14;
     vec2 cloudUV = (dir.xz / projY) * 1.45 + uWindOffset;
@@ -81,37 +95,38 @@ void main() {
     float detailNoise = fbmClouds(cloudUV * 2.35 + uWindOffset * 0.6);
     float cloudField = mix(baseNoise, detailNoise, 0.32);
 
-    // Threshold cloud density from coverage
-    float threshold = mix(0.76, 0.24, uCloudCoverage);
+    float effectiveCov = clamp(uCloudCoverage + localStorm * 0.75, 0.0, 1.0);
+    float effectiveDark = clamp(uCloudDarkness + localStorm * 0.82, 0.0, 1.0);
+
+    float threshold = mix(0.76, 0.22, effectiveCov);
     float density = smoothstep(threshold, threshold + 0.28, cloudField);
 
-    // Self-shadowing sample stepped toward sun for silver/gold linings & heavy undersides
     vec2 sunStep = uSunDir.xz * 0.16;
     float sunSample = fbmClouds(cloudUV + sunStep);
     float litEdge = clamp((cloudField - sunSample) * 2.4 + 0.55, 0.0, 1.0);
 
     vec3 cloudBright = mix(uHorizonColor * 1.12, uSunColor * 1.18, 0.45 * uSunVisibility);
-    vec3 cloudShadow = mix(uZenithColor * 0.55, vec3(0.06, 0.09, 0.13), uCloudDarkness);
-    vec3 cloudCol = mix(cloudShadow, cloudBright, litEdge * (1.0 - 0.72 * uCloudDarkness));
+    vec3 cloudShadow = mix(uZenithColor * 0.55, vec3(0.06, 0.09, 0.13), effectiveDark);
+    vec3 cloudCol = mix(cloudShadow, cloudBright, litEdge * (1.0 - 0.74 * effectiveDark));
 
-    // Internal storm cloud illumination from nearby/sheet lightning
     float hotDot = max(dot(dir, normalize(uLightningHotspot)), 0.0);
-    float cloudScatter = pow(hotDot, 3.5) * uLightningStrength * 0.85 + uFlashIntensity * 0.22;
+    float cloudScatter = pow(hotDot, 3.5) * uLightningStrength * 0.95 + uFlashIntensity * 0.22;
     cloudCol += vec3(0.72, 0.86, 1.0) * cloudScatter * (0.35 + 0.65 * density);
 
-    // Sun disc occluded by thick cloud cover
-    float sunThroughCloud = (1.0 - density * 0.92) * uSunVisibility;
+    float sunThroughCloud = (1.0 - density * 0.92) * uSunVisibility * (1.0 - localStorm * 0.95);
     skyCol += uSunColor * sunDisc * 4.5 * sunThroughCloud;
 
-    // Horizon atmospheric fade so clouds melt seamlessly into fog
     float horizonFade = smoothstep(0.01, 0.22, dir.y);
-    skyCol = mix(skyCol, cloudCol, density * horizonFade * (0.55 + 0.45 * uCloudCoverage));
+    skyCol = mix(skyCol, cloudCol, density * horizonFade * (0.55 + 0.45 * effectiveCov));
+
+    // Distant rain-shaft curtain hanging beneath the Storm Ahead squall wall
+    float rainShaftMask = stormSector * smoothstep(0.24, 0.02, dir.y) * smoothstep(0.0, 0.03, dir.y);
+    float rainStreaks = 0.75 + 0.25 * noise2(vec2(stormAngle * 38.0, dir.y * 8.0 + uTime * 1.8));
+    skyCol = mix(skyCol, vec3(0.14, 0.19, 0.25), rainShaftMask * rainStreaks * 0.68);
   }
 
-  // Global lightning sky ambient pulse
   skyCol += vec3(0.45, 0.58, 0.82) * uFlashIntensity * 0.16;
 
-  // Below horizon blends smoothly to horizon color
   if (dir.y < 0.0) {
     skyCol = mix(uHorizonColor, uZenithColor * 0.3, clamp(-dir.y * 4.0, 0.0, 1.0));
   }
@@ -122,7 +137,7 @@ void main() {
 
 /**
  * Manages procedural sky dome, directional sun light, hemisphere fill,
- * horizon fog, and dynamic weather lighting transitions.
+ * horizon fog, localized Storm Ahead cloud wall, and dynamic weather lighting.
  */
 export class SkyAndAtmosphere {
   public readonly skyMesh: THREE.Mesh;
@@ -156,6 +171,9 @@ export class SkyAndAtmosphere {
         uLightningHotspot: { value: new THREE.Vector3(0, 0.3, -1) },
         uLightningStrength: { value: 0 },
         uFlashIntensity: { value: 0 },
+        uStormDir: { value: new THREE.Vector3(0, 0, -1) },
+        uStormAngularRadius: { value: 0.45 },
+        uStormIntensity: { value: 0 },
       },
     });
 
@@ -164,11 +182,9 @@ export class SkyAndAtmosphere {
     this.skyMesh.renderOrder = -10;
     scene.add(this.skyMesh);
 
-    // Warm/cool hemisphere fill (sky vs deep ocean bounce)
     this.hemiLight = new THREE.HemisphereLight('#8ec1e6', '#132c3d', 0.85);
     scene.add(this.hemiLight);
 
-    // Primary Sun DirectionalLight with tight shadow frustum around the bridge & foredeck
     this.sunLight = new THREE.DirectionalLight('#ffe4bd', 2.4);
     this.sunLight.castShadow = !isSoftwareGl;
     if (!isSoftwareGl) {
@@ -187,12 +203,10 @@ export class SkyAndAtmosphere {
     scene.add(this.sunLight);
     scene.add(this.sunLight.target);
 
-    // Subtle cool atmospheric back/fill light to sculpt bridge & railings in overcast weather
     this.rimLight = new THREE.DirectionalLight('#6b88a3', 0.45);
     scene.add(this.rimLight);
     scene.add(this.rimLight.target);
 
-    // Exponential horizon fog
     this.fog = new THREE.FogExp2('#98bcd4', 0.00028);
     scene.fog = this.fog;
   }
@@ -202,14 +216,13 @@ export class SkyAndAtmosphere {
     elapsedTime: number,
     weather: WeatherParams,
     lightning: LightningState,
+    stormCell: StormCellState,
     shipX: number,
     shipZ: number,
     renderer: THREE.WebGLRenderer,
   ): void {
-    // Keep sky dome centered around ship
     this.skyMesh.position.set(shipX, 0, shipZ);
 
-    // Compute sun direction vector
     const cosEl = Math.cos(weather.sunElevation);
     this.sunDirection.set(
       Math.sin(weather.sunAzimuth) * cosEl,
@@ -217,12 +230,10 @@ export class SkyAndAtmosphere {
       -Math.cos(weather.sunAzimuth) * cosEl,
     ).normalize();
 
-    // Advance cloud drift along wind vector
     const windSpeedScale = 0.0014 * (0.4 + weather.windSpeed * 0.09);
     this.windOffset.x += Math.cos(weather.windAngle) * windSpeedScale * dt;
     this.windOffset.y += Math.sin(weather.windAngle) * windSpeedScale * dt;
 
-    // Update sky shader uniforms
     const u = this.skyMaterial.uniforms;
     u.uTime.value = elapsedTime;
     u.uSunDir.value.copy(this.sunDirection);
@@ -236,8 +247,10 @@ export class SkyAndAtmosphere {
     u.uLightningHotspot.value.copy(lightning.cloudHotspot);
     u.uLightningStrength.value = lightning.hotspotStrength;
     u.uFlashIntensity.value = lightning.flashIntensity;
+    u.uStormDir.value.copy(stormCell.bearingDir);
+    u.uStormAngularRadius.value = stormCell.angularRadius;
+    u.uStormIntensity.value = stormCell.active ? stormCell.intensity : 0;
 
-    // Update sun & fill lights following ship
     this.sunLight.position
       .copy(this.sunDirection)
       .multiplyScalar(75)
@@ -262,7 +275,6 @@ export class SkyAndAtmosphere {
     this.hemiLight.intensity =
       0.55 + weather.sunVisibility * 0.4 + lightning.flashIntensity * 0.55;
 
-    // Fog blends smoothly with lightning flashes
     this.fog.color.copy(weather.fogColor);
     if (lightning.flashIntensity > 0.01) {
       this.fog.color.lerp(

@@ -99,6 +99,9 @@ uniform vec3 uLightningHotspot;
 uniform float uLightningStrength;
 uniform float uFlashIntensity;
 uniform vec3 uLightningDir;
+uniform vec3 uStormDir;
+uniform float uStormAngularRadius;
+uniform float uStormIntensity;
 
 // Ship wake uniforms
 uniform vec3 uShipPos;       // (x, y, z)
@@ -183,6 +186,14 @@ vec3 sampleSkyReflection(vec3 dir) {
 
   float hotDot = max(dot(dir, normalize(uLightningHotspot)), 0.0);
   skyCol += vec3(0.62, 0.78, 1.0) * (pow(hotDot, 3.0) * uLightningStrength * 0.55 + uFlashIntensity * 0.18);
+
+  if (uStormIntensity > 0.01) {
+    vec2 dirXZ = normalize(dir.xz + vec2(1e-5));
+    vec2 stormXZ = normalize(uStormDir.xz + vec2(1e-5));
+    float stormAngle = acos(clamp(dot(dirXZ, stormXZ), -1.0, 1.0));
+    float stormSector = (1.0 - smoothstep(uStormAngularRadius * 0.35, uStormAngularRadius * 1.15, stormAngle)) * uStormIntensity;
+    skyCol = mix(skyCol, vec3(0.11, 0.16, 0.21), stormSector * 0.72);
+  }
   return skyCol;
 }
 
@@ -310,7 +321,15 @@ void main() {
 
   // Exponential atmospheric fog (matches THREE.FogExp2 exactly)
   float fogFactor = 1.0 - exp(-uFogDensity * uFogDensity * vDistance * vDistance);
-  color = mix(color, uFogColor, clamp(fogFactor, 0.0, 1.0));
+  vec3 effectiveFog = uFogColor;
+  if (uStormIntensity > 0.01 && vDistance > 160.0) {
+    vec2 viewXZ = normalize(vWorldPos.xz - cameraPosition.xz + vec2(1e-5));
+    vec2 stormXZ = normalize(uStormDir.xz + vec2(1e-5));
+    float sAng = acos(clamp(dot(viewXZ, stormXZ), -1.0, 1.0));
+    float sMask = (1.0 - smoothstep(uStormAngularRadius * 0.35, uStormAngularRadius * 1.15, sAng)) * uStormIntensity;
+    effectiveFog = mix(effectiveFog, vec3(0.12, 0.17, 0.23), sMask * 0.78);
+  }
+  color = mix(color, effectiveFog, clamp(fogFactor, 0.0, 1.0));
 
   gl_FragColor = vec4(color, 1.0);
 }
@@ -360,6 +379,9 @@ export class OceanRenderer {
         uLightningStrength: { value: 0 },
         uFlashIntensity: { value: 0 },
         uLightningDir: { value: new THREE.Vector3(0, 1, -1) },
+        uStormDir: { value: new THREE.Vector3(0, 0, -1) },
+        uStormAngularRadius: { value: 0.45 },
+        uStormIntensity: { value: 0 },
         uShipPos: { value: new THREE.Vector3() },
         uShipYaw: { value: 0 },
         uShipSpeed: { value: 5.5 },
@@ -444,6 +466,9 @@ export class OceanRenderer {
     sunDir: THREE.Vector3,
     fogColor: THREE.Color,
     lightning: LightningState,
+    stormBearingDir: THREE.Vector3,
+    stormAngularRadius: number,
+    stormIntensity: number,
   ): void {
     this.mesh.position.set(originX, 0, originZ);
 
@@ -469,6 +494,9 @@ export class OceanRenderer {
     u.uLightningStrength.value = lightning.hotspotStrength;
     u.uFlashIntensity.value = lightning.flashIntensity;
     u.uLightningDir.value.copy(lightning.flashDirection);
+    u.uStormDir.value.copy(stormBearingDir);
+    u.uStormAngularRadius.value = stormAngularRadius;
+    u.uStormIntensity.value = stormIntensity;
 
     u.uShipPos.value.set(ship.x, ship.y, ship.z);
     u.uShipYaw.value = ship.yaw;

@@ -148,13 +148,14 @@ export class ParticleEffects {
     weather: WeatherParams,
     lightning: LightningState,
   ): void {
-    this.updateRain(dt, camera, weather, lightning);
+    this.updateRain(dt, camera, ship, weather, lightning);
     this.updateSpray(dt, ship, weather, lightning);
   }
 
   private updateRain(
     dt: number,
     camera: THREE.PerspectiveCamera,
+    ship: ShipState,
     weather: WeatherParams,
     lightning: LightningState,
   ): void {
@@ -174,6 +175,8 @@ export class ParticleEffects {
     const cx = camera.position.x;
     const cy = camera.position.y;
     const cz = camera.position.z;
+    const cyCos = Math.cos(ship.yaw);
+    const cySin = Math.sin(ship.yaw);
 
     const halfX = RAIN_BOX_X * 0.5;
     const halfY = RAIN_BOX_Y * 0.5;
@@ -198,14 +201,35 @@ export class ParticleEffects {
       this.rainSeeds[i3 + 1] = ry;
       this.rainSeeds[i3 + 2] = rz;
 
-      const i6 = i * 6;
-      this.rainPositions[i6] = rx;
-      this.rainPositions[i6 + 1] = ry;
-      this.rainPositions[i6 + 2] = rz;
+      // Keep rain streaks outside the enclosed wheelhouse cabin
+      const dx = rx - ship.x;
+      const dz = rz - ship.z;
+      const localX = dx * cyCos - dz * cySin;
+      const localZ = dx * cySin + dz * cyCos;
+      const localY = ry - ship.y;
+      let drawX = rx;
+      let drawZ = rz;
+      if (
+        Math.abs(localX) < 4.55 &&
+        localZ > 0.25 &&
+        localZ < 5.75 &&
+        localY > 5.0 &&
+        localY < 8.6
+      ) {
+        // Project drop forward outside the windshield so view stays sheltered
+        const shiftZ = -6.5;
+        drawX += shiftZ * cySin;
+        drawZ += shiftZ * cyCos;
+      }
 
-      this.rainPositions[i6 + 3] = rx - windX * 0.72 * streakTime;
+      const i6 = i * 6;
+      this.rainPositions[i6] = drawX;
+      this.rainPositions[i6 + 1] = ry;
+      this.rainPositions[i6 + 2] = drawZ;
+
+      this.rainPositions[i6 + 3] = drawX - windX * 0.72 * streakTime;
       this.rainPositions[i6 + 4] = ry + fall * streakTime;
-      this.rainPositions[i6 + 5] = rz - windZ * 0.72 * streakTime;
+      this.rainPositions[i6 + 5] = drawZ - windZ * 0.72 * streakTime;
     }
 
     (this.rainLines.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;

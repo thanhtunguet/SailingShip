@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { LightningState, WeatherParams } from './types';
+import { LightningState, StormCellState, WeatherParams } from './types';
 
 interface ActiveBolt {
   group: THREE.Group;
@@ -11,7 +11,6 @@ interface ActiveBolt {
   duration: number;
   peakIntensity: number;
   doubleStroke: boolean;
-  worldOriginOffset: THREE.Vector3;
   isNearby: boolean;
 }
 
@@ -20,7 +19,7 @@ const MAX_SEGMENTS = 140;
 
 /**
  * Generates procedural 3D forked lightning bolts, cloud sheet flashes,
- * multi-stroke flicker envelopes, and dynamic flash illumination.
+ * and localized Storm-Ahead strikes with multi-stroke flicker envelopes.
  */
 export class LightningSystem {
   public readonly state: LightningState = {
@@ -33,7 +32,7 @@ export class LightningSystem {
 
   public readonly flashLight: THREE.DirectionalLight;
   private readonly bolts: ActiveBolt[] = [];
-  private timeUntilNextEvent = 8.0;
+  private timeUntilNextEvent = 6.0;
   private sheetAge = -1;
   private sheetDuration = 0.28;
   private sheetPeak = 0;
@@ -103,34 +102,45 @@ export class LightningSystem {
       duration: 0.3,
       peakIntensity: 1,
       doubleStroke: false,
-      worldOriginOffset: new THREE.Vector3(),
       isNearby: false,
     };
+  }
+
+  public triggerImmediateCellStrike(stormCell: StormCellState): void {
+    this.timeUntilNextEvent = 0.6;
+    if (stormCell.active) {
+      this.triggerCellLightning(stormCell);
+    }
   }
 
   public update(
     dt: number,
     weather: WeatherParams,
+    stormCell: StormCellState,
     shipX: number,
     shipZ: number,
     shipYaw: number,
   ): LightningState {
-    // Schedule randomized lightning during storms
-    if (weather.lightningRate > 0.05) {
-      this.timeUntilNextEvent -= dt * (weather.lightningRate / 6.0);
+    const cellRate = stormCell.active ? stormCell.intensity * 9.5 : 0;
+    const effectiveRate = Math.max(weather.lightningRate, cellRate);
+
+    if (effectiveRate > 0.05) {
+      this.timeUntilNextEvent -= dt * (effectiveRate / 6.0);
       if (this.timeUntilNextEvent <= 0) {
-        this.triggerLightningEvent(shipX, shipZ, shipYaw);
-        // Randomized interval: 3.5s to 15s (scaled by rate)
-        this.timeUntilNextEvent = 3.5 + Math.random() * 11.5;
+        if (stormCell.active && stormCell.intensity > 0.15 && weather.lightningRate < 2.0) {
+          this.triggerCellLightning(stormCell);
+        } else {
+          this.triggerLightningEvent(shipX, shipZ, shipYaw);
+        }
+        this.timeUntilNextEvent = 2.8 + Math.random() * 8.5;
       }
     } else {
-      this.timeUntilNextEvent = 5.0;
+      this.timeUntilNextEvent = 4.0;
     }
 
     let totalFlash = 0;
     let totalHotspot = 0;
 
-    // Update sheet lightning envelope
     if (this.sheetAge >= 0) {
       this.sheetAge += dt;
       if (this.sheetAge >= this.sheetDuration) {
@@ -143,7 +153,6 @@ export class LightningSystem {
       }
     }
 
-    // Update active 3D lightning bolts
     for (const bolt of this.bolts) {
       if (!bolt.group.visible) continue;
       bolt.age += dt;
@@ -165,7 +174,6 @@ export class LightningSystem {
     this.state.flashIntensity = Math.min(totalFlash, 2.4);
     this.state.hotspotStrength = Math.min(totalHotspot, 2.5);
 
-    // Position lightning DirectionalLight along the active flash direction
     this.flashLight.position
       .copy(this.state.flashDirection)
       .multiplyScalar(220)
@@ -177,17 +185,47 @@ export class LightningSystem {
     return this.state;
   }
 
+  private triggerCellLightning(cell: StormCellState): void {
+    const jitterAngle = Math.random() * Math.PI * 2;
+    const jitterR = Math.random() * cell.radius * 0.45;
+    const strikeX = cell.x + Math.cos(jitterAngle) * jitterR;
+    const strikeZ = cell.z + Math.sin(jitterAngle) * jitterR;
+
+    const dirX = cell.bearingDir.x;
+    const dirZ = cell.bearingDir.z;
+
+    if (Math.random() < 0.35) {
+      this.sheetAge = 0;
+      this.sheetDuration = 0.25 + Math.random() * 0.16;
+      this.sheetPeak = 0.55 + cell.proximity * 0.5;
+      this.state.cloudHotspot.set(dirX, 0.2, dirZ).normalize();
+      this.state.flashDirection.copy(this.state.cloudHotspot);
+      return;
+    }
+
+    const isNearby = cell.distance < 550;
+    const cloudHeight = isNearby ? 230 + Math.random() * 70 : 320 + Math.random() * 110;
+    const bolt = this.bolts.find((b) => !b.group.visible) ?? this.bolts[0];
+    this.buildBoltGeometry(bolt, strikeX, cloudHeight, strikeZ, isNearby);
+
+    bolt.group.visible = true;
+    bolt.age = 0;
+    bolt.duration = 0.32;
+    bolt.peakIntensity = 0.72 + cell.proximity * 0.85;
+    bolt.doubleStroke = true;
+    bolt.isNearby = isNearby;
+
+    this.state.cloudHotspot.set(dirX, 0.22, dirZ).normalize();
+    this.state.flashDirection.set(dirX, 0.35, dirZ).normalize();
+  }
+
   private triggerLightningEvent(shipX: number, shipZ: number, shipYaw: number): void {
-    // Pick bearing within forward ~150 degree cone so user sees strikes ahead/flanks
-    const forwardBearing = shipYaw + Math.PI; // note: yaw=0 -> forward is -Z
     const relAngle = (Math.random() - 0.5) * 2.3;
     const dirX = Math.sin(shipYaw) * -Math.cos(relAngle) + Math.cos(shipYaw) * Math.sin(relAngle);
     const dirZ = -Math.cos(shipYaw) * Math.cos(relAngle) - Math.sin(shipYaw) * Math.sin(relAngle);
-    void forwardBearing;
 
     const roll = Math.random();
     if (roll < 0.42) {
-      // Cloud-to-cloud sheet lightning
       this.sheetAge = 0;
       this.sheetDuration = 0.22 + Math.random() * 0.18;
       this.sheetPeak = 0.45 + Math.random() * 0.45;
@@ -196,7 +234,6 @@ export class LightningSystem {
       return;
     }
 
-    // Spawn 3D bolt (nearby ~28%, distant ~72%)
     const isNearby = roll > 0.78;
     const distance = isNearby
       ? 260 + Math.random() * 340
@@ -230,7 +267,6 @@ export class LightningSystem {
     const segments: Array<[number, number, number, number, number, number]> = [];
     const lateralScale = isNearby ? 26 : 52;
 
-    // Recursive midpoint displacement for realistic jagged leader + branches
     const subdivide = (
       x1: number,
       y1: number,
@@ -283,7 +319,6 @@ export class LightningSystem {
       coreArr[idx + 4] = y2;
       coreArr[idx + 5] = z2;
 
-      // Slight offset glow layer for multi-pixel bloom feel
       glowArr[idx] = x1 + 0.65;
       glowArr[idx + 1] = y1;
       glowArr[idx + 2] = z1 + 0.65;
@@ -299,12 +334,10 @@ export class LightningSystem {
   }
 
   private evaluateFlickerEnvelope(u: number, doubleStroke: boolean): number {
-    // Primary sharp peak at u ~ 0.08
     const stroke1 = Math.exp(-Math.pow((u - 0.08) * 14.0, 2));
     if (!doubleStroke) {
       return stroke1 * 1.0 + Math.max(0, 1 - u * 1.4) * 0.25;
     }
-    // Secondary re-strike around u ~ 0.42
     const stroke2 = Math.exp(-Math.pow((u - 0.42) * 11.0, 2)) * 0.88;
     const afterglow = Math.max(0, 1 - u) * 0.18;
     return Math.min(1.2, stroke1 + stroke2 + afterglow);

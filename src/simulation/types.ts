@@ -7,6 +7,30 @@ export type WeatherState =
   | 'SEVERE_THUNDERSTORM'
   | 'STORM_RECOVERY';
 
+export type WeatherControlMode = 'AUTO' | WeatherState;
+
+export type WiperMode = 'AUTO' | 'ON' | 'OFF';
+
+export interface WeatherOverrides {
+  mode: WeatherControlMode;
+  windSpeed: number | null; // m/s (2..32)
+  windAngle: number | null; // radians (0..2PI)
+  cloudCoverage: number | null; // 0..1
+  cloudDarkness: number | null; // 0..1
+}
+
+export interface StormCellState {
+  active: boolean;
+  x: number;
+  z: number;
+  radius: number;
+  intensity: number; // 0..1 ramp
+  proximity: number; // 0 = distant on horizon, 1 = inside storm core
+  angularRadius: number; // visual angular width on horizon
+  bearingDir: THREE.Vector3; // unit vector from ship toward storm cell
+  distance: number;
+}
+
 export interface WeatherParams {
   windSpeed: number; // m/s (4 to 30)
   windAngle: number; // radians in XZ plane
@@ -32,6 +56,21 @@ export interface WeatherParams {
   waterShallowColor: THREE.Color;
   lightningRate: number; // flashes per minute (0 in calm, ~5-9 in storm)
   exposure: number;
+}
+
+export interface SimulationTelemetry {
+  mode: WeatherControlMode;
+  currentState: WeatherState;
+  windSpeed: number;
+  windAngleDeg: number;
+  cloudCoverage: number;
+  cloudDarkness: number;
+  stormActive: boolean;
+  stormDistance: number;
+  hasOverrides: boolean;
+  wiperMode: WiperMode;
+  wiperSpeed: number;
+  wiperActive: boolean;
 }
 
 export interface GerstnerWaveComponent {
